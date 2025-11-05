@@ -29,6 +29,8 @@ def get_param_groups(
     scale_and_norm_group = []
     # readout_group = [] # unused
     for name, param in named_parameters:
+        if not param.requires_grad:
+            continue
         lname = name.lower()
         if "wte" in lname or "embedding" in lname or "abacus" in lname or "lm_head" in lname:
             embedding_group.append(param)

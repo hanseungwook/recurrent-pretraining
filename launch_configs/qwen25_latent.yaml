@@ -1,0 +1,101 @@
+# Qwen2.5 7B latent-recurrent finetuning starting from frozen prelude weights
+
+# Main settings
+run_name: qwen25_latent
+resume: false
+max_tokens: 1_000_000_000  # adjust as needed
+seed: 42
+out_dir: outputs/qwen25_latent
+
+# Model configuration
+model_name: deluge-raven-4b
+model_impl: dynamic
+block_size: 4096
+model_overwrite:
+  vocab_size: 152064
+  padding_multiple: 256
+  n_embd: 3584
+  intermediate_size: 18944
+  num_attention_heads: 28
+  num_key_value_heads: 4
+  block_class_name: TransformerPreNormBlock
+  norm_class_name: RMSNorm_llama
+  norm_eps: 1e-6
+  mlp_class_name: GatedMLP
+  nonlin_name: SiLU
+  bias: false
+  qk_bias: false
+  tie_embeddings: false
+  injection_type: add
+  n_layers_in_prelude: 4
+  n_layers_in_recurrent_block: 4
+  n_layers_in_coda: 2
+  mean_recurrence: 32
+  mean_backprop_depth: 8
+  rope_settings.rope_base: 1000000
+  pretrained_non_recurrent_hf_model: Qwen/Qwen2.5-7B
+  pretrained_non_recurrent_prefixes:
+    - transformer.wte
+    - transformer.prelude
+    - transformer.ln_f
+  freeze_prelude: true
+  frozen_module_prefixes:
+    - transformer.wte
+    - transformer.ln_f
+  trainable_module_prefixes:
+    - transformer.core_block
+    - transformer.adapter
+    - transformer.coda
+    - lm_head
+
+# Training hyperparameters
+world_batch_size: 256
+micro_batch_size: 4
+batch_size_ramp: 0
+optimizer: AdamW
+optim_config:
+  lr: 1.5e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+min_lr: 1.5e-5
+warmup_steps: 2000
+lr_schedule: cosine
+cooldown_steps: 0
+no_weight_decay_for_bias_and_norm_params: true
+
+# Regularization
+z_regularization: 0.0
+
+# Implementation and backend
+compile_model: false
+gradient_checkpointing: true
+loss_guardrail_active: true
+skip_nonfinite_grads: true
+
+# Logging / evaluation
+logger_project: "latent-recurrent"
+log_step_interval: 100
+save_step_interval: 5000
+eval_step_interval: 2000
+eval_iters: 64
+save_last_step: true
+partial_depth_eval: [8, 16, 32]
+
+# Data Handling
+all_block_size_tensors: true
+pad_to_block_size: true
+data_config:
+  train_data:
+    - type: pkds
+      prefix: ""
+      weight: 1
+      data_dir: "$DATA_DIR/fineweb-sample/packed2"
+  val_data:
+    - type: pkds
+      prefix: ""
+      weight: 1
+      data_dir: "$DATA_DIR/fineweb-sample/packed2"
+
+tokenizer_path: Qwen/Qwen2.5-7B

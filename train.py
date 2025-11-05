@@ -51,6 +51,7 @@ from recpre.tokenizer import Tokenizer
 from recpre.huggingface_dataset import HuggingfaceDataset, ParquetStream, ParquetStreamPure, RandomTokensDataset
 from recpre.data_loading_utils import generic_collate_fn
 import recpre.utils
+import recpre.model_dynamic as model_dynamic
 from recpre.data_scheduler_utils import DataSchedulerTracker, DataScheduler
 from recpre.monitor import (
     enable_monitoring_on_step,
@@ -180,6 +181,429 @@ def setup_fabric(cfg: CLISettings) -> Fabric:
 ####################################################################################################
 
 
+def _clean_state_dict_key(key: str) -> str:
+    """Remove wrapper prefixes from checkpoint parameter names."""
+    tokens = key.split(".")
+    removable = {"_orig_mod", "_original_module", "module", "model"}
+    while tokens and tokens[0] in removable:
+        tokens.pop(0)
+    return ".".join(tokens)
+
+
+def _match_prefix(name: str, prefixes: tuple[str, ...]) -> bool:
+    return any(name.startswith(prefix) for prefix in prefixes)
+
+
+def _load_pretrained_state_dict(path: Path) -> dict[str, torch.Tensor]:
+    """Load and flatten a checkpoint to a simple parameter dictionary."""
+    state = torch.load(path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise ValueError(f"Checkpoint at {path} does not contain a state dictionary.")
+    raw = state
+    while True:
+        candidate = None
+        for key in ("model", "state_dict"):
+            value = raw.get(key)
+            if isinstance(value, dict):
+                candidate = value
+                break
+        if candidate is None:
+            break
+        raw = candidate
+    tensors: dict[str, torch.Tensor] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, torch.Tensor):
+            continue
+        cleaned_key = _clean_state_dict_key(key)
+        if cleaned_key:
+            tensors[cleaned_key] = value
+    if not tensors:
+        raise ValueError(f"Could not extract any tensors from checkpoint at {path}.")
+    return tensors
+
+
+def _apply_pretrained_tensors(
+    model: nn.Module,
+    fabric: Fabric,
+    tensors: dict[str, torch.Tensor],
+    prefixes: tuple[str, ...],
+    strict: bool,
+    source_description: str,
+) -> int:
+    if not tensors:
+        return 0
+    targets: dict[str, torch.Tensor] = {}
+    targets.update(dict(model.named_buffers()))
+    targets.update(dict(model.named_parameters()))
+
+    loaded, skipped = [], []
+    with torch.no_grad():
+        for key, tensor in tensors.items():
+            if not _match_prefix(key, prefixes):
+                continue
+            target = targets.get(key)
+            if target is None:
+                skipped.append((key, "missing in current model"))
+                continue
+            if target.shape != tensor.shape:
+                skipped.append((key, f"shape mismatch {tuple(target.shape)} != {tuple(tensor.shape)}"))
+                continue
+            target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+            loaded.append(key)
+
+    fabric.print(
+        f"Loaded {len(loaded)} tensors from {source_description} "
+        f"for prefixes {prefixes} (skipped {len(skipped)})."
+    )
+    if skipped:
+        preview = "\n".join(f"  - {name}: {reason}" for name, reason in skipped[:10])
+        fabric.print(f"Skipped entries while loading pretrained weights:\n{preview}")
+        if strict:
+            raise ValueError(
+                "Pretrained weights load had mismatches while pretrained_strict=True. "
+                "See details above."
+            )
+    return len(loaded)
+
+
+def _get_default_prelude_prefixes(config) -> tuple[str, ...]:
+    prefixes = getattr(config, "pretrained_non_recurrent_prefixes", ())
+    if not prefixes:
+        prefixes = ("transformer.wte", "transformer.prelude", "transformer.ln_f")
+    return tuple(prefixes)
+
+
+def maybe_load_pretrained_non_recurrent(model: nn.Module, cfg: CLISettings, fabric: Fabric) -> None:
+    """Optionally load a pretrained checkpoint for the non-recurrent parts of the model."""
+    config = cfg.model_config
+    prefixes = _get_default_prelude_prefixes(config)
+    strict = getattr(config, "pretrained_strict", False)
+
+    total_loaded = 0
+
+    hf_model_name = getattr(config, "pretrained_non_recurrent_hf_model", None)
+    if hf_model_name:
+        hf_tensors = _load_pretrained_non_recurrent_from_hf(model, cfg, fabric)
+        total_loaded += _apply_pretrained_tensors(
+            model,
+            fabric,
+            hf_tensors,
+            prefixes,
+            strict,
+            source_description=f"Hugging Face model {hf_model_name}",
+        )
+        hf_tensors.clear()
+
+    checkpoint_attr = getattr(config, "pretrained_non_recurrent_checkpoint", None)
+    if checkpoint_attr:
+        resolved_path = Path(os.path.expandvars(str(checkpoint_attr))).expanduser()
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"pretrained_non_recurrent_checkpoint {resolved_path} does not exist.")
+
+        fabric.print(f"Loading non-recurrent parameters from {resolved_path}")
+        pretrained_state = _load_pretrained_state_dict(resolved_path)
+        total_loaded += _apply_pretrained_tensors(
+            model,
+            fabric,
+            pretrained_state,
+            prefixes,
+            strict,
+            source_description=str(resolved_path),
+        )
+        pretrained_state.clear()
+
+    if total_loaded == 0 and (hf_model_name or checkpoint_attr):
+        fabric.print(
+            "Warning: No pretrained tensors were loaded. "
+            "Check that the provided sources and prefixes target existing parameters."
+        )
+
+
+def _load_pretrained_non_recurrent_from_hf(model: nn.Module, cfg: CLISettings, fabric: Fabric) -> dict[str, torch.Tensor]:
+    config = cfg.model_config
+    hf_model_name = getattr(config, "pretrained_non_recurrent_hf_model", None)
+    if hf_model_name is None:
+        return {}
+
+    try:
+        from transformers import AutoModelForCausalLM
+    except ImportError as exc:
+        raise ImportError(
+            "transformers is required to load pretrained Hugging Face weights. "
+            "Install it with `pip install transformers`."
+        ) from exc
+
+    load_kwargs = dict(
+        revision=getattr(config, "pretrained_non_recurrent_hf_revision", None),
+        use_auth_token=getattr(config, "pretrained_non_recurrent_hf_token", None),
+        torch_dtype="auto",
+        trust_remote_code=getattr(config, "pretrained_non_recurrent_hf_trust_remote_code", False),
+        cache_dir=getattr(config, "pretrained_non_recurrent_hf_cache_dir", None),
+        local_files_only=getattr(config, "pretrained_non_recurrent_hf_local_files_only", False),
+        low_cpu_mem_usage=True,
+    )
+    # Remove None entries to avoid warnings
+    load_kwargs = {k: v for k, v in load_kwargs.items() if v is not None}
+
+    fabric.print(f"Loading Hugging Face model '{hf_model_name}' with kwargs {load_kwargs}")
+    hf_model = AutoModelForCausalLM.from_pretrained(hf_model_name, **load_kwargs)
+    hf_model.eval()
+    hf_model.to("cpu")
+
+    model_type = getattr(hf_model.config, "model_type", None)
+    if model_type in {"llama", "mistral", "mixtral"}:
+        tensors = _extract_llama_prelude_tensors(hf_model, model, cfg)
+    elif model_type in {"gpt2"}:
+        tensors = _extract_gpt2_prelude_tensors(hf_model, model, cfg)
+    else:
+        raise ValueError(
+            f"Unsupported Hugging Face model_type {model_type!r} for prelude loading. "
+            "Currently supported: 'llama', 'mistral', 'mixtral', 'gpt2'."
+        )
+
+    del hf_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return tensors
+
+
+def _get_hf_backbone_module(hf_model: nn.Module) -> nn.Module:
+    for attr in ("model", "transformer", "base_model"):
+        module = getattr(hf_model, attr, None)
+        if module is not None:
+            return module
+    return hf_model
+
+
+def _extract_llama_prelude_tensors(hf_model: nn.Module, target_model: nn.Module, cfg: CLISettings) -> dict[str, torch.Tensor]:
+    base_model = _get_hf_backbone_module(hf_model)
+    if not hasattr(base_model, "layers"):
+        raise ValueError("Expected Hugging Face model to expose `layers` for llama-style architectures.")
+
+    config = cfg.model_config
+    prelude_layers = getattr(target_model.transformer, "prelude", [])
+    num_target_layers = len(prelude_layers)
+    if config.n_layers_in_prelude > num_target_layers:
+        raise ValueError(
+            f"Configured n_layers_in_prelude={config.n_layers_in_prelude} but only {num_target_layers} layers exist in target prelude."
+        )
+    if config.n_layers_in_prelude > len(base_model.layers):
+        raise ValueError(
+            f"Hugging Face model only has {len(base_model.layers)} layers, cannot load {config.n_layers_in_prelude} prelude layers."
+        )
+
+    tensors: dict[str, torch.Tensor] = {}
+
+    if hasattr(base_model, "embed_tokens"):
+        tensors["transformer.wte.weight"] = base_model.embed_tokens.weight.detach().cpu()
+    elif hasattr(base_model, "wte"):
+        tensors["transformer.wte.weight"] = base_model.wte.weight.detach().cpu()
+
+    if hasattr(base_model, "norm") and hasattr(target_model.transformer, "ln_f"):
+        tensors["transformer.ln_f.weight"] = base_model.norm.weight.detach().cpu()
+        ln_f_bias = getattr(base_model.norm, "bias", None)
+        if ln_f_bias is not None:
+            tensors["transformer.ln_f.bias"] = ln_f_bias.detach().cpu()
+
+    for layer_idx in range(config.n_layers_in_prelude):
+        prefix = f"transformer.prelude.{layer_idx}"
+        hf_layer = base_model.layers[layer_idx]
+        target_block = prelude_layers[layer_idx]
+
+        if hasattr(target_block, "norm_1") and hasattr(hf_layer, "input_layernorm"):
+            tensors[f"{prefix}.norm_1.weight"] = hf_layer.input_layernorm.weight.detach().cpu()
+            norm_bias = getattr(hf_layer.input_layernorm, "bias", None)
+            if norm_bias is not None:
+                tensors[f"{prefix}.norm_1.bias"] = norm_bias.detach().cpu()
+
+        if hasattr(target_block, "norm_2") and hasattr(hf_layer, "post_attention_layernorm"):
+            tensors[f"{prefix}.norm_2.weight"] = hf_layer.post_attention_layernorm.weight.detach().cpu()
+            norm_bias = getattr(hf_layer.post_attention_layernorm, "bias", None)
+            if norm_bias is not None:
+                tensors[f"{prefix}.norm_2.bias"] = norm_bias.detach().cpu()
+
+        if hasattr(target_block, "attn") and hasattr(hf_layer, "self_attn"):
+            q_weight = hf_layer.self_attn.q_proj.weight.detach().cpu()
+            k_weight = hf_layer.self_attn.k_proj.weight.detach().cpu()
+            v_weight = hf_layer.self_attn.v_proj.weight.detach().cpu()
+            tensors[f"{prefix}.attn.Wqkv.weight"] = torch.cat([q_weight, k_weight, v_weight], dim=0)
+
+            target_qkv_bias = getattr(target_block.attn.Wqkv, "bias", None)
+            if target_qkv_bias is not None:
+                source_biases = (
+                    getattr(hf_layer.self_attn.q_proj, "bias", None),
+                    getattr(hf_layer.self_attn.k_proj, "bias", None),
+                    getattr(hf_layer.self_attn.v_proj, "bias", None),
+                )
+                chunks = getattr(target_block.attn, "chunks", [q_weight.shape[0], k_weight.shape[0], v_weight.shape[0]])
+                target_bias_cpu = target_qkv_bias.detach().cpu()
+                bias_chunks = []
+                offset = 0
+                for source_bias, size in zip(source_biases, chunks):
+                    if source_bias is None:
+                        bias_chunks.append(target_bias_cpu[offset : offset + size].clone().zero_())
+                    else:
+                        bias_chunks.append(source_bias.detach().cpu())
+                    offset += size
+                tensors[f"{prefix}.attn.Wqkv.bias"] = torch.cat(bias_chunks, dim=0)
+
+            tensors[f"{prefix}.attn.proj.weight"] = hf_layer.self_attn.o_proj.weight.detach().cpu()
+            proj_bias = getattr(hf_layer.self_attn.o_proj, "bias", None)
+            target_proj_bias = getattr(target_block.attn.proj, "bias", None)
+            if target_proj_bias is not None:
+                if proj_bias is None:
+                    tensors[f"{prefix}.attn.proj.bias"] = target_proj_bias.detach().cpu().clone().zero_()
+                else:
+                    tensors[f"{prefix}.attn.proj.bias"] = proj_bias.detach().cpu()
+
+        hf_mlp = getattr(hf_layer, "mlp", None)
+        target_mlp = getattr(target_block, "mlp", None)
+        if hf_mlp is None or target_mlp is None:
+            continue
+
+        if not isinstance(target_mlp, model_dynamic.GatedMLP):
+            raise ValueError(
+                f"Unsupported MLP type {type(target_mlp)} for llama-style prelude weight import."
+            )
+
+        gate_weight = hf_mlp.gate_proj.weight.detach().cpu()
+        up_weight = hf_mlp.up_proj.weight.detach().cpu()
+        tensors[f"{prefix}.mlp.fc.weight"] = torch.cat([gate_weight, up_weight], dim=0)
+
+        if getattr(target_mlp.fc, "bias", None) is not None:
+            total_dim = target_mlp.fc.bias.shape[0]
+            split = total_dim // 2
+            gate_bias = getattr(hf_mlp.gate_proj, "bias", None)
+            up_bias = getattr(hf_mlp.up_proj, "bias", None)
+            gate_bias_tensor = gate_bias.detach().cpu() if gate_bias is not None else target_mlp.fc.bias.detach().cpu()[:split].clone().zero_()
+            up_bias_tensor = up_bias.detach().cpu() if up_bias is not None else target_mlp.fc.bias.detach().cpu()[split:].clone().zero_()
+            tensors[f"{prefix}.mlp.fc.bias"] = torch.cat([gate_bias_tensor, up_bias_tensor], dim=0)
+
+        tensors[f"{prefix}.mlp.proj.weight"] = hf_mlp.down_proj.weight.detach().cpu()
+        target_proj_bias = getattr(target_mlp.proj, "bias", None)
+        if target_proj_bias is not None:
+            down_bias = getattr(hf_mlp.down_proj, "bias", None)
+            if down_bias is None:
+                tensors[f"{prefix}.mlp.proj.bias"] = target_proj_bias.detach().cpu().clone().zero_()
+            else:
+                tensors[f"{prefix}.mlp.proj.bias"] = down_bias.detach().cpu()
+
+    return tensors
+
+
+def _extract_gpt2_prelude_tensors(hf_model: nn.Module, target_model: nn.Module, cfg: CLISettings) -> dict[str, torch.Tensor]:
+    base_model = _get_hf_backbone_module(hf_model)
+    if not hasattr(base_model, "h"):
+        raise ValueError("Expected GPT2-like model to expose a `.h` attribute with transformer blocks.")
+
+    config = cfg.model_config
+    prelude_layers = getattr(target_model.transformer, "prelude", [])
+    num_target_layers = len(prelude_layers)
+    if config.n_layers_in_prelude > num_target_layers:
+        raise ValueError(
+            f"Configured n_layers_in_prelude={config.n_layers_in_prelude} but only {num_target_layers} layers exist in target prelude."
+        )
+    if config.n_layers_in_prelude > len(base_model.h):
+        raise ValueError(
+            f"GPT-2 model only has {len(base_model.h)} layers, cannot load {config.n_layers_in_prelude} prelude layers."
+        )
+
+    tensors: dict[str, torch.Tensor] = {}
+
+    if hasattr(base_model, "wte"):
+        tensors["transformer.wte.weight"] = base_model.wte.weight.detach().cpu()
+    if hasattr(base_model, "ln_f") and hasattr(target_model.transformer, "ln_f"):
+        tensors["transformer.ln_f.weight"] = base_model.ln_f.weight.detach().cpu()
+        tensors["transformer.ln_f.bias"] = base_model.ln_f.bias.detach().cpu()
+
+    for layer_idx in range(config.n_layers_in_prelude):
+        prefix = f"transformer.prelude.{layer_idx}"
+        hf_layer = base_model.h[layer_idx]
+        target_block = prelude_layers[layer_idx]
+
+        if hasattr(target_block, "norm_1") and hasattr(hf_layer, "ln_1"):
+            tensors[f"{prefix}.norm_1.weight"] = hf_layer.ln_1.weight.detach().cpu()
+            tensors[f"{prefix}.norm_1.bias"] = hf_layer.ln_1.bias.detach().cpu()
+
+        if hasattr(target_block, "attn") and hasattr(hf_layer, "attn"):
+            tensors[f"{prefix}.attn.Wqkv.weight"] = hf_layer.attn.c_attn.weight.detach().cpu().t()
+            if getattr(target_block.attn.Wqkv, "bias", None) is not None:
+                tensors[f"{prefix}.attn.Wqkv.bias"] = hf_layer.attn.c_attn.bias.detach().cpu()
+            tensors[f"{prefix}.attn.proj.weight"] = hf_layer.attn.c_proj.weight.detach().cpu().t()
+            if getattr(target_block.attn.proj, "bias", None) is not None:
+                tensors[f"{prefix}.attn.proj.bias"] = hf_layer.attn.c_proj.bias.detach().cpu()
+
+        if hasattr(target_block, "norm_2") and hasattr(hf_layer, "ln_2"):
+            tensors[f"{prefix}.norm_2.weight"] = hf_layer.ln_2.weight.detach().cpu()
+            tensors[f"{prefix}.norm_2.bias"] = hf_layer.ln_2.bias.detach().cpu()
+
+        hf_mlp = getattr(hf_layer, "mlp", None)
+        target_mlp = getattr(target_block, "mlp", None)
+        if hf_mlp is None or target_mlp is None:
+            continue
+
+        if hasattr(target_mlp, "fc") and hasattr(hf_mlp, "c_fc"):
+            tensors[f"{prefix}.mlp.fc.weight"] = hf_mlp.c_fc.weight.detach().cpu().t()
+            if getattr(target_mlp.fc, "bias", None) is not None:
+                tensors[f"{prefix}.mlp.fc.bias"] = hf_mlp.c_fc.bias.detach().cpu()
+        else:
+            raise ValueError("Expected target MLP to expose `fc` layer compatible with GPT-2 c_fc.")
+
+        if hasattr(target_mlp, "proj") and hasattr(hf_mlp, "c_proj"):
+            tensors[f"{prefix}.mlp.proj.weight"] = hf_mlp.c_proj.weight.detach().cpu().t()
+            if getattr(target_mlp.proj, "bias", None) is not None:
+                tensors[f"{prefix}.mlp.proj.bias"] = hf_mlp.c_proj.bias.detach().cpu()
+        else:
+            raise ValueError("Expected target MLP to expose `proj` layer compatible with GPT-2 c_proj.")
+
+    return tensors
+
+
+def maybe_apply_freeze_config(model: nn.Module, cfg: CLISettings, fabric: Fabric) -> None:
+    """Apply fine-tuning freeze strategy based on the config."""
+    config = cfg.model_config
+    trainable_prefixes = tuple(getattr(config, "trainable_module_prefixes", ()))
+    frozen_prefixes = set(getattr(config, "frozen_module_prefixes", ()))
+    if getattr(config, "freeze_prelude", False):
+        frozen_prefixes.add("transformer.prelude")
+    frozen_prefixes = tuple(sorted(frozen_prefixes))
+
+    if not trainable_prefixes and not frozen_prefixes:
+        return
+
+    if trainable_prefixes:
+        for param in model.parameters():
+            param.requires_grad = False
+        for name, param in model.named_parameters():
+            if _match_prefix(name, trainable_prefixes):
+                param.requires_grad = True
+    if frozen_prefixes:
+        for name, param in model.named_parameters():
+            if _match_prefix(name, frozen_prefixes):
+                param.requires_grad = False
+
+    trainable_params = recpre.utils.num_parameters(model, requires_grad=True)
+    frozen_params = recpre.utils.num_parameters(model, requires_grad=False)
+    fabric.print(f"Parameter allocation -> trainable: {trainable_params:,} | frozen: {frozen_params:,}")
+
+    if trainable_prefixes:
+        missing_trainable = [
+            prefix
+            for prefix in trainable_prefixes
+            if not any(
+                name.startswith(prefix) and param.requires_grad for name, param in model.named_parameters()
+            )
+        ]
+        if missing_trainable:
+            fabric.print(f"Warning: No parameters matched trainable prefixes {missing_trainable}")
+    if frozen_prefixes:
+        unused_frozen = [
+            prefix for prefix in frozen_prefixes if not any(name.startswith(prefix) for name, _ in model.named_parameters())
+        ]
+        if unused_frozen:
+            fabric.print(f"Warning: No parameters matched frozen prefixes {unused_frozen}")
+
+
 def startup(fabric: Fabric, cfg: CLISettings):
     """The main driver function for the training script."""
     start_time = time.time()
@@ -260,6 +684,8 @@ def startup(fabric: Fabric, cfg: CLISettings):
             tokenizer=tokenizer.processor,
             gradient_checkpointing=cfg.gradient_checkpointing and "fsdp" not in cfg.fabric_strategy,
         )
+    maybe_load_pretrained_non_recurrent(model, cfg, fabric)
+    maybe_apply_freeze_config(model, cfg, fabric)
     fabric.print(f"{time.ctime()[:-5]}: Time to instantiate model: {time.time() - t0:.02f} seconds.")
     num_params = recpre.utils.num_parameters(model)
     fabric.log_to_summary({"num_parameters": num_params, "device": torch.cuda.get_device_name()})

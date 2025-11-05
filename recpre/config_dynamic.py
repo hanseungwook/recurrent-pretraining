@@ -417,6 +417,18 @@ class RecurrentConfig(Config):
     # sac to force saving of mm and sdpa, # per-iteration / per-block to change granularity:
     activation_checkpoint_impl: str = "per-iteration"
     tie_embeddings: bool = False
+    freeze_prelude: bool = False
+    frozen_module_prefixes: tuple[str, ...] = field(default_factory=tuple)
+    trainable_module_prefixes: tuple[str, ...] = field(default_factory=tuple)
+    pretrained_non_recurrent_checkpoint: Optional[str] = None
+    pretrained_non_recurrent_prefixes: tuple[str, ...] = field(default_factory=tuple)
+    pretrained_strict: bool = False
+    pretrained_non_recurrent_hf_model: Optional[str] = None
+    pretrained_non_recurrent_hf_revision: Optional[str] = None
+    pretrained_non_recurrent_hf_token: Optional[str] = None
+    pretrained_non_recurrent_hf_local_files_only: bool = False
+    pretrained_non_recurrent_hf_trust_remote_code: bool = False
+    pretrained_non_recurrent_hf_cache_dir: Optional[str] = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -437,6 +449,9 @@ class RecurrentConfig(Config):
             verbose=False,
             skip_reinitializing=self.skip_initialization,
         )
+        self.frozen_module_prefixes = tuple(self.frozen_module_prefixes or ())
+        self.trainable_module_prefixes = tuple(self.trainable_module_prefixes or ())
+        self.pretrained_non_recurrent_prefixes = tuple(self.pretrained_non_recurrent_prefixes or ())
 
     def construct_model(self, **kwargs) -> torch.nn.Module:
         from recpre.model_dynamic import RecurrentGPT
